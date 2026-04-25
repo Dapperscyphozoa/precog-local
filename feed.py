@@ -37,7 +37,7 @@ HL_REST_URL = "https://api.hyperliquid.xyz/info"
 # How many parallel WS connections to split universe across.
 # HL closes connections that subscribe to too many channels at once.
 WS_NUM_CONNECTIONS = 4
-SUB_DELAY_SEC = 0.30   # delay between subscribes (was 0.05 — too aggressive)
+SUB_DELAY_SEC = 1.0   # was 0.3 — try slower to see if HL is rate-limiting subs
 
 
 class CandleFeed:
@@ -170,7 +170,11 @@ class CandleFeed:
                             msg = json.loads(raw)
                         except Exception:
                             continue
-                        if msg.get('channel') != 'candle':
+                        ch = msg.get('channel')
+                        if ch != 'candle':
+                            # Log non-candle replies (subscriptionResponse, error, etc)
+                            if ch in ('error', 'subscriptionResponse'):
+                                log.info(f"WS-{conn_idx} {ch}: {str(msg)[:200]}")
                             continue
                         d = msg.get('data') or {}
                         coin = d.get('s')
@@ -214,16 +218,24 @@ class CandleFeed:
                                     except Exception as e:
                                         log.warning(f"on_candle_close err {coin}: {e}")
                             buf.append(new_candle)
-            except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
+            except websockets.ConnectionClosed as e:
                 self._connected_count = max(0, self._connected_count - 1)
                 self.stats['reconnects'] += 1
                 self.stats['errors'] += 1
-                log.warning(f"WS-{conn_idx} disconnected: {e} — reconnecting in 5s")
+                code = getattr(e, 'code', None) or getattr(getattr(e, 'rcvd', None), 'code', None)
+                reason = getattr(e, 'reason', None) or getattr(getattr(e, 'rcvd', None), 'reason', None)
+                log.warning(f"WS-{conn_idx} closed: code={code} reason={reason!r} — reconnecting in 5s")
+                await asyncio.sleep(5)
+            except (OSError, asyncio.TimeoutError) as e:
+                self._connected_count = max(0, self._connected_count - 1)
+                self.stats['reconnects'] += 1
+                self.stats['errors'] += 1
+                log.warning(f"WS-{conn_idx} disconnected: {type(e).__name__}: {e} — reconnecting in 5s")
                 await asyncio.sleep(5)
             except Exception as e:
                 self._connected_count = max(0, self._connected_count - 1)
                 self.stats['errors'] += 1
-                log.error(f"WS-{conn_idx} unexpected: {e}")
+                log.error(f"WS-{conn_idx} unexpected: {type(e).__name__}: {e}")
                 await asyncio.sleep(5)
 
     async def run(self):
