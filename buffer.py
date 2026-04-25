@@ -81,21 +81,46 @@ class TimeframeBuffer:
         self._cache = defaultdict(dict)
 
     def get(self, coin, tf, n=200):
-        """Get last n candles for coin at timeframe tf."""
+        """Get last n candles for coin at timeframe tf.
+
+        For 15m: combines seeded historical bars (from REST seed at startup)
+        with live-aggregated bars from the 1m feed. This means the signal
+        engine has full history immediately on day 1 instead of waiting
+        12+ hours for live 1m bars to roll up into 50+ 15m bars.
+        """
         candles_1m = self.feed.get_recent(coin, n=self.max_per_tf)
-        if not candles_1m:
-            return []
         if tf == '1m':
             return candles_1m[-n:]
-        # Cache check: if last 1m timestamp is the same, return cached
+
+        # Live-aggregated from 1m
+        live_agg = aggregate(candles_1m, tf) if candles_1m else []
+
+        # For 15m: also pull seeded bars from feed and merge
+        if tf == '15m':
+            seeded = self.feed.get_seeded_15m(coin)
+            if seeded:
+                # Merge: use seeded for everything before earliest live bar,
+                # use live for everything from there forward.
+                if live_agg:
+                    live_start_t = live_agg[0]['t']
+                    older = [c for c in seeded if c['t'] < live_start_t]
+                    merged = older + live_agg
+                else:
+                    merged = list(seeded)
+                merged = merged[-self.max_per_tf:]
+                # Cache for return
+                last_t = candles_1m[-1]['t'] if candles_1m else (seeded[-1]['t'] if seeded else 0)
+                self._cache[coin][tf] = (last_t, merged)
+                return merged[-n:]
+
+        # 1h/4h: pure live aggregation (we don't seed these directly)
+        if not candles_1m:
+            return []
         last_t = candles_1m[-1]['t']
         cached = self._cache[coin].get(tf)
         if cached and cached[0] == last_t:
             return cached[1][-n:]
-        # Recompute
-        agg = aggregate(candles_1m, tf)
-        # Cap to max_per_tf
-        agg = agg[-self.max_per_tf:]
+        agg = live_agg[-self.max_per_tf:]
         self._cache[coin][tf] = (last_t, agg)
         return agg[-n:]
 
