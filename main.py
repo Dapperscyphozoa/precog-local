@@ -249,15 +249,19 @@ async def amain():
 
     start_health_server(state, port=int(os.environ.get('PORT') or os.environ.get('PRECOG_HEALTH_PORT') or 8765))
 
-    # Seed history (one-time)
-    log.info("Seeding history via REST (1m + 15m, ~5 min for 78 coins)…")
-    state.feed.seed_history(n_1m=200, n_15m=200)
+    # Run seed in parallel with WS — previous version blocked on seed for
+    # 5-10 min before WS even connected. Now WS streams live data within
+    # seconds, seed fills in history in background via worker thread.
+    async def _seed_in_background():
+        await asyncio.to_thread(state.feed.seed_history, 200, 200)
+        log.info("Background seed complete")
 
-    log.info("Launching WebSocket feed + tick loop + state persistence")
+    log.info("Launching WS feed + tick loop + parallel seed")
     await asyncio.gather(
         state.feed.run(),
         tick_loop(state, config),
         state_persistence_loop(state, state_path, interval_sec=60),
+        _seed_in_background(),
     )
 
 
