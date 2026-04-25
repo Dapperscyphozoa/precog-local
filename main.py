@@ -250,8 +250,8 @@ async def amain():
     start_health_server(state, port=int(os.environ.get('PORT') or os.environ.get('PRECOG_HEALTH_PORT') or 8765))
 
     # Seed history (one-time)
-    log.info("Seeding 1m history via REST (one-time, ~2 min for 78 coins)…")
-    state.feed.seed_history(n_bars=200)
+    log.info("Seeding history via REST (1m + 15m, ~5 min for 78 coins)…")
+    state.feed.seed_history(n_1m=200, n_15m=200)
 
     log.info("Launching WebSocket feed + tick loop + state persistence")
     await asyncio.gather(
