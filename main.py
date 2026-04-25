@@ -122,14 +122,18 @@ async def tick_loop(state, config):
     strat_params = config['strategy']
 
     log.info(f"Tick loop starting (interval={tick_interval}s)")
-    # Warm-up wait
+    # Warm-up wait — start ticking as soon as we have enough seeded bars.
+    # The feed.is_healthy() check is too strict on Fly+HL where WS connections
+    # are fragile; we accept stale-by-a-minute data because the seeded 15m
+    # bars are what actually drive signal evaluation.
     while True:
-        if state.feed.is_healthy():
-            ready = sum(1 for c in universe if len(state.feed.get_recent(c, n=min_bars)) >= min_bars)
-            if ready >= len(universe) * 0.5:
-                log.info(f"Feed warm: {ready}/{len(universe)} coins have ≥{min_bars} bars")
-                break
-        log.info(f"Waiting for feed warm-up… ({state.feed.status()})")
+        ready_1m = sum(1 for c in universe if len(state.feed.get_recent(c, n=min_bars)) >= min_bars)
+        ready_15m = sum(1 for c in universe if len(state.feed.get_seeded_15m(c)) >= min_bars)
+        ready = max(ready_1m, ready_15m)
+        if ready >= len(universe) * 0.5:
+            log.info(f"Feed warm: {ready}/{len(universe)} coins ready (1m={ready_1m}, seeded_15m={ready_15m})")
+            break
+        log.info(f"Waiting for warm-up… 1m={ready_1m} seeded_15m={ready_15m} need={int(len(universe)*0.5)} ({state.feed.status()})")
         await asyncio.sleep(5)
 
     while True:
