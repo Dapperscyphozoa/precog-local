@@ -1,0 +1,77 @@
+{
+  "_comment": "PreCog Local Engine config. Copy to config.json and edit secrets.",
+
+  "universe": [
+    "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "TRX",
+    "DOT", "MATIC", "LTC", "BCH", "UNI", "ATOM", "ETC", "NEAR", "APT", "ARB",
+    "OP", "INJ", "SUI", "FIL", "AAVE", "MKR", "PEPE", "WLD", "TIA", "RUNE",
+    "FTM", "STX", "IMX", "GRT", "RNDR", "ALGO", "VET", "HBAR", "QNT", "ICP",
+    "MANA", "SAND", "AXS", "GALA", "CRV", "ENJ", "JTO", "SEI", "ORDI", "WIF",
+    "JUP", "STRK", "MEME", "ENA", "PYTH", "BONK", "FLOKI", "SHIB", "ONDO",
+    "BLUR", "MASK", "ENS", "PENDLE", "ETHFI", "DYM", "ALT", "PIXEL",
+    "PORTAL", "AI", "SUPER", "TURBO", "MEW", "POPCAT", "BOME", "PRCL",
+    "REZ", "BB", "NOT"
+  ],
+
+  "render": {
+    "webhook_url": "https://precog-i8c3.onrender.com/webhook",
+    "webhook_secret": "fd40f4c63e239dfe3028a45b5c6f8c5c078af5d5d2c5b059dd5af2841684b4af",
+    "_note": "Webhook URL + secret. Render server only handles execution."
+  },
+
+  "feed": {
+    "primary_ws": "wss://api.hyperliquid.xyz/ws",
+    "intervals_to_subscribe": ["1m"],
+    "_note": "Subscribe to 1m only. We roll up locally to 15m/1h/4h."
+  },
+
+  "engine": {
+    "tick_interval_sec": 30,
+    "min_bars_required": 50,
+    "primary_tf": "15m",
+    "buffer_size_per_tf": 500,
+    "max_positions": 10,
+    "_note": "tick_interval is how often we evaluate signals. buffer_size = bars retained per coin per tf."
+  },
+
+  "strategy": {
+    "rsi_period": 14,
+    "rsi_long_max": 25,
+    "rsi_short_min": 75,
+    "ext_lookback": 70,
+    "wick_min_ratio": 0.2,
+    "structural_pivot_n": 3,
+    "pivot_lookback_left": 5,
+    "pivot_lookback_right": 5,
+    "ema_fast": 9,
+    "ema_slow": 21,
+    "atr_period": 14,
+    "atr_floor_pct": 0.0015,
+    "sl_atr_mult": 2.0,
+    "tp1_atr_mult": 2.5,
+    "tp2_atr_mult": 5.0,
+    "min_volume_pct_of_avg": 0.7,
+    "_note": "Validated PreCog confluence params (~80% WR backtested). atr_floor_pct rejects low-volatility setups. tp1/tp2 splits per spec §5."
+  },
+
+  "risk": {
+    "equity_usd": 559.0,
+    "risk_pct_per_trade": 0.15,
+    "leverage": 15,
+    "min_notional_usd": 11,
+    "force_notional_usd": 11,
+    "rr_min": 1.2,
+    "wr_hard_floor": 0.20,
+    "wr_soft_floor": 0.35,
+    "wr_soft_size_mult": 0.3,
+    "atr_floor_pct": 0.0015,
+    "max_consecutive_losses": 5,
+    "cooldown_after_signal_sec": 1800,
+    "_note": "force_notional_usd: bypasses sizing for testing. Set to 0 for live."
+  },
+
+  "execution": {
+    "dry_run": false,
+    "_note": "When true, signals are logged but not POSTed to Render. Set false to go live."
+  }
+}
