@@ -8,8 +8,12 @@ HL WS protocol:
   - Subscribe: {"method":"subscribe","subscription":{"type":"candle","coin":"BTC","interval":"1m"}}
   - Receive: {"channel":"candle","data":{"t":<open_ms>,"T":<close_ms>,"s":"BTC","i":"1m","o":"...","c":"...","h":"...","l":"...","v":"...","n":<trades>}}
 
-Single connection, multiplexes 78 subscriptions. Auto-reconnect on disconnect.
-On startup, also seeds historical bars via REST so we don't wait 4 hours for 4h candles.
+Multi-connection design: HL drops sockets when subscribed to too many channels
+on one connection. We split the universe across N parallel connections
+(default 4 → ~20 subs per socket).
+
+On startup, seeds 1m bars (live-feed catch-up) AND 15m bars (so signal
+evaluation can run immediately without waiting hours of 15m candles to form).
 """
 
 import asyncio
@@ -23,28 +27,33 @@ try:
 except ImportError:
     raise SystemExit("Install: pip install websockets")
 
-try:
-    import urllib.request
-except ImportError:
-    raise SystemExit("urllib.request not available")
+import urllib.request
 
 log = logging.getLogger("feed")
 
 HL_WS_URL = "wss://api.hyperliquid.xyz/ws"
 HL_REST_URL = "https://api.hyperliquid.xyz/info"
 
+# How many parallel WS connections to split universe across.
+# HL closes connections that subscribe to too many channels at once.
+WS_NUM_CONNECTIONS = 4
+SUB_DELAY_SEC = 0.30   # delay between subscribes (was 0.05 — too aggressive)
+
 
 class CandleFeed:
-    """Live candle stream. Updates _live_candles in-place as bars form/close."""
+    """Live candle stream. Updates _candles in-place as bars form/close."""
 
     def __init__(self, universe, interval="1m", on_candle_close=None):
         self.universe = list(universe)
         self.interval = interval
-        self.on_candle_close = on_candle_close  # callable(coin, candle_dict)
+        self.on_candle_close = on_candle_close
 
-        # {coin: deque[candle_dict]}  — candle_dict = {t, o, h, l, c, v, closed}
+        # 1m live stream
         self._candles = defaultdict(lambda: deque(maxlen=600))
-        self._connected = False
+        # Seeded 15m bars (so signal eval has data on day 1)
+        self._seeded_15m = defaultdict(list)
+
+        self._connected_count = 0
         self._last_msg_ts = 0
         self.stats = {
             'msgs_received': 0,
@@ -55,82 +64,104 @@ class CandleFeed:
         }
 
     def get_recent(self, coin, n=100):
-        """Return last n candles for coin as list of dicts (oldest first)."""
+        """Return last n live 1m candles for coin."""
         c = list(self._candles.get(coin, []))
         return c[-n:] if len(c) >= n else c
 
+    def get_seeded_15m(self, coin):
+        """Return seeded 15m bars (oldest→newest)."""
+        return list(self._seeded_15m.get(coin, []))
+
     def is_healthy(self):
-        """True if we've received a message in the last 30s and connection alive."""
-        return self._connected and (time.time() - self._last_msg_ts) < 30
+        return (self._connected_count > 0 and
+                (time.time() - self._last_msg_ts) < 30)
 
     def status(self):
         return {
-            'connected': self._connected,
+            'connected_count': self._connected_count,
+            'connection_target': WS_NUM_CONNECTIONS,
             'last_msg_age_sec': round(time.time() - self._last_msg_ts, 1) if self._last_msg_ts else None,
-            'coins_tracked': len(self._candles),
+            'coins_tracked_1m': len(self._candles),
+            'coins_tracked_15m_seeded': len(self._seeded_15m),
             'universe_size': len(self.universe),
             **self.stats,
         }
 
     # ─────────────────────────────────────────────────────────
-    # SEED — pull initial bars via REST (one-time per coin)
+    # SEED — REST fetch to populate buffers BEFORE WS catches up
     # ─────────────────────────────────────────────────────────
-    def seed_history(self, n_bars=200):
-        """One-time REST fetch to populate buffers before live stream takes over.
-        Without this we'd have empty buffers until the first 1m candle closes.
-        """
-        log.info(f"Seeding {len(self.universe)} coins with {n_bars} bars each (one-time)…")
+    def _rest_candles(self, coin, interval, n_bars):
         end_ms = int(time.time() * 1000)
-        # 1m bars: end - n_bars * 60s
-        start_ms = end_ms - n_bars * 60 * 1000
-        ok = 0
+        sec_per_bar = {'1m': 60, '15m': 900, '1h': 3600, '4h': 14400}.get(interval, 60)
+        start_ms = end_ms - n_bars * sec_per_bar * 1000
+        body = json.dumps({
+            "type": "candleSnapshot",
+            "req": {"coin": coin, "interval": interval,
+                    "startTime": start_ms, "endTime": end_ms}
+        }).encode()
+        req = urllib.request.Request(HL_REST_URL, data=body,
+            headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return json.loads(r.read())
+
+    def seed_history(self, n_1m=200, n_15m=200):
+        """Two-pass seed: 1m for live continuity + 15m for instant signal eligibility.
+
+        With n_15m=200, signal engine has 200 15m bars available immediately.
+        That's ~50 hours of history — plenty for ext_lookback=70 and pivots.
+        """
+        log.info(f"Seeding {len(self.universe)} coins (1m×{n_1m}, 15m×{n_15m}) via REST…")
+        ok_1m = ok_15m = 0
         for coin in self.universe:
+            # 1m
             try:
-                body = json.dumps({
-                    "type": "candleSnapshot",
-                    "req": {"coin": coin, "interval": self.interval,
-                            "startTime": start_ms, "endTime": end_ms}
-                }).encode()
-                req = urllib.request.Request(HL_REST_URL, data=body,
-                    headers={'Content-Type': 'application/json'})
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    data = json.loads(r.read())
+                data = self._rest_candles(coin, '1m', n_1m)
                 for bar in data:
                     self._candles[coin].append({
-                        't': int(bar['t']),
-                        'o': float(bar['o']),
-                        'h': float(bar['h']),
-                        'l': float(bar['l']),
-                        'c': float(bar['c']),
-                        'v': float(bar['v']),
+                        't': int(bar['t']), 'o': float(bar['o']), 'h': float(bar['h']),
+                        'l': float(bar['l']), 'c': float(bar['c']), 'v': float(bar['v']),
                         'closed': True,
                     })
-                ok += 1
-                # Be polite to REST during seed
-                time.sleep(1.5)
+                ok_1m += 1
             except Exception as e:
-                log.warning(f"seed err {coin}: {str(e)[:80]}")
-        log.info(f"Seed complete: {ok}/{len(self.universe)} coins loaded")
-        return ok
+                log.warning(f"seed 1m err {coin}: {str(e)[:80]}")
+            time.sleep(1.5)
+            # 15m
+            try:
+                data = self._rest_candles(coin, '15m', n_15m)
+                self._seeded_15m[coin] = [{
+                    't': int(bar['t']), 'o': float(bar['o']), 'h': float(bar['h']),
+                    'l': float(bar['l']), 'c': float(bar['c']), 'v': float(bar['v']),
+                    'closed': True,
+                } for bar in data]
+                ok_15m += 1
+            except Exception as e:
+                log.warning(f"seed 15m err {coin}: {str(e)[:80]}")
+            time.sleep(1.5)
+        log.info(f"Seed complete: 1m={ok_1m}/{len(self.universe)}  15m={ok_15m}/{len(self.universe)}")
+        return ok_1m, ok_15m
 
     # ─────────────────────────────────────────────────────────
-    # LIVE STREAM
+    # LIVE STREAM — multi-connection split
     # ─────────────────────────────────────────────────────────
-    async def run(self):
-        """Connect, subscribe, process. Auto-reconnect on disconnect."""
+    async def _run_one_connection(self, conn_idx, coins):
+        """Run one WS connection responsible for a subset of coins."""
         while True:
             try:
-                async with websockets.connect(HL_WS_URL, ping_interval=20, ping_timeout=10) as ws:
-                    self._connected = True
-                    log.info(f"WS connected to {HL_WS_URL}")
-                    # Subscribe to all coins in batches (HL accepts one sub per message)
-                    for coin in self.universe:
+                async with websockets.connect(
+                    HL_WS_URL, ping_interval=20, ping_timeout=20,
+                    close_timeout=5, max_size=2**20,
+                ) as ws:
+                    self._connected_count += 1
+                    log.info(f"WS-{conn_idx} connected ({len(coins)} coins)")
+                    # Subscribe to assigned coins
+                    for coin in coins:
                         sub = {"method": "subscribe",
                                "subscription": {"type": "candle", "coin": coin,
                                                 "interval": self.interval}}
                         await ws.send(json.dumps(sub))
-                        await asyncio.sleep(0.05)  # don't slam the WS handshake
-                    log.info(f"Subscribed to {len(self.universe)} coins ({self.interval})")
+                        await asyncio.sleep(SUB_DELAY_SEC)
+                    log.info(f"WS-{conn_idx} subscribed to {len(coins)} coins")
                     # Receive loop
                     async for raw in ws:
                         self._last_msg_ts = time.time()
@@ -145,7 +176,6 @@ class CandleFeed:
                         coin = d.get('s')
                         if not coin:
                             continue
-                        # Build candle record
                         try:
                             new_candle = {
                                 't': int(d['t']),
@@ -154,15 +184,12 @@ class CandleFeed:
                                 'l': float(d['l']),
                                 'c': float(d['c']),
                                 'v': float(d['v']),
-                                'closed': False,  # in-progress
+                                'closed': False,
                             }
                         except (KeyError, TypeError, ValueError):
                             continue
                         buf = self._candles[coin]
-                        # 2026-04-25: forward-fill gap detection (spec §3.1).
-                        # If new bar's t is more than 1 minute after last known
-                        # bar, synthesize the missing minutes by carrying close
-                        # forward. Volume = 0 on filled bars to mark them.
+                        # Forward-fill gap detection
                         if buf and buf[-1]['t'] + 60_000 < new_candle['t']:
                             last_close = buf[-1]['c']
                             gap_t = buf[-1]['t'] + 60_000
@@ -176,29 +203,37 @@ class CandleFeed:
                                 self.stats['candles_closed'] += 1
                                 self.stats['forward_fills'] += 1
                                 gap_t += 60_000
-                        # Last candle in buffer — does it match this t?
                         if buf and buf[-1]['t'] == new_candle['t']:
-                            # Update in place (still forming)
                             buf[-1] = new_candle
                         else:
-                            # Previous candle closes when a new t arrives
                             if buf:
                                 buf[-1]['closed'] = True
                                 self.stats['candles_closed'] += 1
                                 if self.on_candle_close:
-                                    try:
-                                        self.on_candle_close(coin, buf[-1])
+                                    try: self.on_candle_close(coin, buf[-1])
                                     except Exception as e:
                                         log.warning(f"on_candle_close err {coin}: {e}")
                             buf.append(new_candle)
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                self._connected = False
+                self._connected_count = max(0, self._connected_count - 1)
                 self.stats['reconnects'] += 1
                 self.stats['errors'] += 1
-                log.warning(f"WS disconnected: {e} — reconnecting in 3s")
-                await asyncio.sleep(3)
-            except Exception as e:
-                self._connected = False
-                self.stats['errors'] += 1
-                log.error(f"WS unexpected: {e}")
+                log.warning(f"WS-{conn_idx} disconnected: {e} — reconnecting in 5s")
                 await asyncio.sleep(5)
+            except Exception as e:
+                self._connected_count = max(0, self._connected_count - 1)
+                self.stats['errors'] += 1
+                log.error(f"WS-{conn_idx} unexpected: {e}")
+                await asyncio.sleep(5)
+
+    async def run(self):
+        """Split universe across WS_NUM_CONNECTIONS parallel sockets."""
+        chunks = [[] for _ in range(WS_NUM_CONNECTIONS)]
+        for i, coin in enumerate(self.universe):
+            chunks[i % WS_NUM_CONNECTIONS].append(coin)
+        log.info(f"Splitting {len(self.universe)} coins across {WS_NUM_CONNECTIONS} WS connections "
+                 f"(~{len(self.universe)//WS_NUM_CONNECTIONS} each)")
+        await asyncio.gather(*[
+            self._run_one_connection(idx, coins)
+            for idx, coins in enumerate(chunks) if coins
+        ])
